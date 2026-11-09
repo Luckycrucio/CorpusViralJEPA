@@ -11,7 +11,7 @@ import time
 import urllib.request
 import zipfile
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -449,11 +449,156 @@ class KmerScreen:
         self.kmers = np.unique(np.concatenate(kmers))
         log(f"  screen '{name}': k={k}, min shared fraction={min_fraction}, {len(self.kmers):,} k-mers")
 
-    def hits(self, windows):
-        queries = kmer_codes(windows, self.k)
-        position = np.searchsorted(self.kmers, queries).clip(max=len(self.kmers) - 1)
-        shared = (self.kmers[position] == queries).mean(1)
-        return shared >= self.min_fraction
+    def hits(self, windows, ids):
+        hit = np.zeros(len(windows), dtype=bool)
+        for start in range(0, len(windows), 50000):
+            queries = kmer_codes(windows[start : start + 50000], self.k)
+            position = np.searchsorted(self.kmers, queries).clip(max=len(self.kmers) - 1)
+            hit[start : start + 50000] = (self.kmers[position] == queries).mean(1) >= self.min_fraction
+        return hit
+
+    def describe(self):
+        return {"name": self.name, "type": "kmer", "k": self.k, "min_fraction": self.min_fraction,
+                "kmers": int(len(self.kmers))}
+
+
+# ------------------------------------------------------------ BLAST screening
+
+
+BLAST_FIELDS = "qseqid sseqid pident evalue sstart send"
+
+
+def find_blast_tool(name, folder):
+    path = Path(folder) / name if folder else shutil.which(name)
+    if path is None or not Path(path).exists():
+        raise RuntimeError(f"{name} not found: install BLAST+ or pass --blast-bin")
+    return str(path)
+
+
+def sequence_number(token):
+    """'w12', 't12', 'lcl|t12' or 'gb|t12|' -> 12. makeblastdb reads ids such as t12345 as GenBank accessions."""
+    return int(re.search(r"(\d+)\D*$", token).group(1))
+
+
+def covered_length(intervals):
+    """Number of positions covered by a list of closed (start, end) intervals."""
+    intervals = sorted(intervals)
+    total, (start, end) = 0, intervals[0]
+    for a, b in intervals[1:]:
+        if a > end + 1:
+            total += end - start + 1
+            start, end = a, b
+        else:
+            end = max(end, b)
+    return total + end - start + 1
+
+
+class BlastScreen:
+    """Drop windows whose blastn alignments cover most of an evaluation read.
+
+    The evaluation reads are the database and the corpus windows are the queries. A window is
+    dropped if, for at least one read, its HSPs with identity > min_identity and E-value <= evalue
+    cover at least min_coverage of that read (union of the HSP intervals on the read, per strand).
+    Every dropped window is listed in blast_screen_hits.csv with the read that removed it.
+    """
+
+    def __init__(self, name, rows, args):
+        self.name = name
+        self.categories = set(args.blast_categories.split(","))
+        unknown = self.categories - set(CATEGORIES)
+        if unknown:
+            raise ValueError(f"unknown --blast-categories {sorted(unknown)}, expected some of {CATEGORIES}")
+        self.min_identity = args.blast_identity
+        self.min_coverage = args.blast_coverage
+        self.evalue = args.blast_evalue
+        self.word_size = args.blast_word_size
+        self.jobs = args.blast_jobs
+        self.chunk = args.blast_chunk
+        self.blastn = find_blast_tool("blastn", args.blast_bin)
+        version = subprocess.run([self.blastn, "-version"], capture_output=True, text=True, check=True)
+        self.version = version.stdout.splitlines()[0]
+        self.read_ids = [row[0] for row in rows]
+        self.read_labels = [row[2] for row in rows]
+        self.read_lengths = np.array([len(row[1]) for row in rows])
+
+        self.work = Path(args.out_dir) / "blast_screen_work"
+        self.work.mkdir(parents=True, exist_ok=True)
+        fasta = self.work / "evaluation.fa"
+        with open(fasta, "w") as out:
+            for index, row in enumerate(rows):
+                out.write(f">lcl|t{index}\n{row[1]}\n")
+        self.db = self.work / "evaluation"
+        command = [find_blast_tool("makeblastdb", args.blast_bin), "-in", str(fasta), "-dbtype", "nucl",
+                   "-parse_seqids", "-out", str(self.db)]
+        subprocess.run(command, check=True, capture_output=True)
+        self.report = open(Path(args.out_dir) / "blast_screen_hits.csv", "w")
+        self.report.write("window_id,test_id,test_label,read_coverage,max_identity,min_evalue\n")
+        log(f"  screen '{name}': {self.version}, {len(rows):,} reads, identity > {self.min_identity:g}%, "
+            f"read coverage >= {self.min_coverage:g}, E <= {self.evalue:g}, word size {self.word_size}, "
+            f"{self.jobs} blastn processes")
+
+    def search(self, windows, offset):
+        """Run blastn on one chunk; return {window index: (coverage, read, identity, E-value)}."""
+        fasta = self.work / f"windows_{offset}.fa"
+        table = self.work / f"windows_{offset}.tsv"
+        with open(fasta, "w") as out:
+            for index, row in enumerate(windows):
+                out.write(f">w{offset + index}\n{BASES[row].tobytes().decode()}\n")
+        # -perc_identity only shrinks the output; the strict "> min_identity" test is applied below.
+        command = [self.blastn, "-task", "blastn", "-word_size", str(self.word_size), "-query", str(fasta),
+                   "-db", str(self.db), "-evalue", str(self.evalue), "-perc_identity", str(self.min_identity),
+                   "-strand", "both", "-dust", "yes", "-max_target_seqs", "500", "-num_threads", "1",
+                   "-outfmt", f"6 {BLAST_FIELDS}", "-out", str(table)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"blastn failed on {fasta}: {result.stderr.strip()}")
+        spans = defaultdict(list)
+        with open(table) as handle:
+            for line in handle:
+                query, read, identity, evalue, start, end = line.split("\t")
+                identity, evalue, start, end = float(identity), float(evalue), int(start), int(end)
+                if identity > self.min_identity and evalue <= self.evalue:
+                    key = (sequence_number(query), sequence_number(read), start <= end)
+                    spans[key].append((min(start, end), max(start, end), identity, evalue))
+        best = {}
+        for (window, read, _), hsps in spans.items():
+            coverage = covered_length([(a, b) for a, b, _, _ in hsps]) / self.read_lengths[read]
+            if coverage >= self.min_coverage and coverage > best.get(window, (0.0,))[0]:
+                best[window] = (coverage, read, max(h[2] for h in hsps), min(h[3] for h in hsps))
+        fasta.unlink()
+        table.unlink()
+        return best
+
+    def hits(self, windows, ids):
+        hit = np.zeros(len(windows), dtype=bool)
+        if not len(windows):
+            return hit
+        started = time.time()
+        with ThreadPoolExecutor(self.jobs) as pool:
+            futures = [pool.submit(self.search, windows[s : s + self.chunk], s)
+                       for s in range(0, len(windows), self.chunk)]
+            for done, future in enumerate(as_completed(futures), 1):
+                for window, (coverage, read, identity, evalue) in future.result().items():
+                    hit[window] = True
+                    self.report.write(f"{ids[window]},{self.read_ids[read]},{self.read_labels[read]},"
+                                      f"{coverage:.3f},{identity:.2f},{evalue:.3g}\n")
+                if done % max(1, len(futures) // 10) == 0 or done == len(futures):
+                    elapsed = time.time() - started
+                    log(f"    blastn {done}/{len(futures)} chunks, {int(hit.sum()):,} windows hit, "
+                        f"{elapsed / 60:.1f} min, ETA {elapsed / done * (len(futures) - done) / 60:.1f} min")
+        self.report.flush()
+        return hit
+
+    def close(self):
+        self.report.close()
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def describe(self):
+        return {"name": self.name, "type": "blastn", "blastn": self.version, "database": "fullset_test.csv",
+                "reads": len(self.read_ids), "categories": sorted(self.categories),
+                "rule": f"drop a window if its HSPs with identity > {self.min_identity:g}% and E-value <= "
+                        f"{self.evalue:g} cover >= {self.min_coverage:g} of one test read",
+                "word_size": self.word_size, "strand": "both", "dust": "yes", "max_target_seqs": 500}
 
 
 def read_viraminer(path):
@@ -462,7 +607,7 @@ def read_viraminer(path):
 
 
 def build_screens(args):
-    """Return (screens for external genomes, screens for the ViraMiner train windows)."""
+    """Return (screens for external genomes, screens for the ViraMiner train windows, BLAST screen or None)."""
     viraminer = Path(args.viraminer_dir)
     anell_test = viraminer / "test_data_anell_300_binary.csv"
     external, own = [], []
@@ -484,7 +629,11 @@ def build_screens(args):
             positives = KmerScreen("anello_unseen_strict", [r[1] for r in rows if r[2] == "1"], *SCREEN_PRESETS["strict"])
             external.append(positives)
             own.append(positives)
-    return external, own
+    blast = None
+    if args.blast_screen:
+        # Runs after the k-mer screens, on the windows they keep.
+        blast = BlastScreen("blast_fullset_test", read_viraminer(viraminer / "fullset_test.csv"), args)
+    return external, own, blast
 
 
 # ------------------------------------------------------------ window sampling
@@ -543,14 +692,14 @@ def finalize_windows(codes, ids, category, args, rng, screens, stats):
         noisy = rng.random(len(codes)) < args.noise_fraction
         mutate = (rng.random(codes.shape) < args.substitution_rate) & noisy[:, None]
         codes[mutate] = (codes[mutate] + rng.integers(1, 4, size=int(mutate.sum()))) % 4
-    keep = np.ones(len(codes), dtype=bool)
+    # Each screen only sees the windows that the previous screens kept.
+    keep = np.arange(len(codes))
     for screen in screens:
-        before = int(keep.sum())
-        for start in range(0, len(codes), 50000):
-            hit = screen.hits(codes[start : start + 50000])
-            keep[start : start + 50000] &= ~hit
-        stats["screened_out"][f"{category}:{screen.name}"] = before - int(keep.sum())
-    return codes[keep], [i for i, k in zip(ids, keep) if k]
+        log(f"  {category}: screen '{screen.name}' on {len(keep):,} windows")
+        hit = screen.hits(codes[keep], [ids[i] for i in keep])
+        stats["screened_out"][f"{category}:{screen.name}"] = int(hit.sum())
+        keep = keep[~hit]
+    return codes[keep], [ids[i] for i in keep]
 
 
 def run_build(args):
@@ -586,7 +735,7 @@ def run_build(args):
     targets = {c: int(round(args.num_windows * w / total)) for c, w in available.items()}
     log(f"Targets: {targets}")
 
-    external_screens, own_screens = build_screens(args)
+    external_screens, own_screens, blast_screen = build_screens(args)
     pool = WindowPool()
 
     if "viraminer" in targets:
@@ -626,6 +775,8 @@ def run_build(args):
     for category, target in targets.items():
         codes, ids = pool.collect(category)
         screens = own_screens if category == "viraminer" else external_screens
+        if blast_screen is not None and category in blast_screen.categories:
+            screens = screens + [blast_screen]
         codes, ids = finalize_windows(codes, ids, category, args, rng, screens, stats)
         if len(codes) > target:
             keep = np.sort(rng.choice(len(codes), target, replace=False))
@@ -635,6 +786,8 @@ def run_build(args):
             log(f"  warning: {category} has {len(codes):,} windows, below target {target:,}")
         final_codes.append(codes)
         final_ids.extend(ids)
+    if blast_screen is not None:
+        blast_screen.close()
 
     codes = np.concatenate(final_codes)
     order = rng.permutation(len(codes))
@@ -664,8 +817,9 @@ def run_build(args):
         "windows_rejected_n_or_short": dict(stats["windows_with_n_or_short"]),
         "windows_screened_out": dict(stats["screened_out"]),
         "screens": {
-            group: [{"name": s.name, "k": s.k, "min_fraction": s.min_fraction, "kmers": int(len(s.kmers))} for s in screens]
-            for group, screens in (("external_genomes", external_screens), ("viraminer_train", own_screens))
+            "external_genomes": [s.describe() for s in external_screens],
+            "viraminer_train": [s.describe() for s in own_screens],
+            "blast": blast_screen.describe() if blast_screen is not None else None,
         },
         "sources": {
             "refseq_viral": REFSEQ_VIRAL_INDEX,
@@ -716,6 +870,19 @@ def parse_args():
         action="store_false",
         help="keep anelloviruses (breaks the anell_test 'unseen family' evaluation)",
     )
+    build.add_argument(
+        "--blast-screen",
+        action="store_true",
+        help="also drop windows that blastn-align to fullset_test over most of a read (needs BLAST+)",
+    )
+    build.add_argument("--blast-identity", type=float, default=70.0, help="HSP identity must be above this (%%)")
+    build.add_argument("--blast-coverage", type=float, default=0.8, help="fraction of the test read the HSPs must cover")
+    build.add_argument("--blast-evalue", type=float, default=1e-3, help="HSP E-value must be at most this")
+    build.add_argument("--blast-word-size", type=int, default=7)
+    build.add_argument("--blast-categories", default=",".join(CATEGORIES), help="categories the BLAST screen applies to")
+    build.add_argument("--blast-jobs", type=int, default=4, help="blastn processes run in parallel")
+    build.add_argument("--blast-chunk", type=int, default=2000, help="windows per blastn call")
+    build.add_argument("--blast-bin", default=None, help="folder with blastn and makeblastdb (default: PATH)")
     build.add_argument("--uhgv-quality", default="Complete,High-quality")
     build.add_argument("--max-per-species", type=int, default=10)
     build.add_argument("--max-genome-weight-bp", type=int, default=50_000)

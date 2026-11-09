@@ -3,6 +3,8 @@
 `build_corpus.py` builds an **unlabeled** corpus of 300 bp DNA windows for JEPA pretraining.
 The output uses the ViraMiner CSV format (`id,sequence,label`), with the label always `-1`.
 The numbers below come from **corpus_v3** (`corpus3_cluster/corpus_v3/manifest.json`).
+**corpus_v4** is the same recipe plus the BLAST screen (step 4b). Its numbers will be in
+`corpus_v4/manifest.json` once the cluster build finishes.
 
 ## Usage
 
@@ -10,15 +12,17 @@ The numbers below come from **corpus_v3** (`corpus3_cluster/corpus_v3/manifest.j
 python build_corpus.py download --raw-dir RAW
 python build_corpus.py build --raw-dir RAW --viraminer-dir dataset/ --out-dir OUT \
     --mix virus_eukaryotic=0.18,virus_prokaryotic=0.325,human=0.25,bacteria=0.20,viraminer=0.045 \
-    --max-per-species 10 --max-genome-weight-bp 50000 --holdout-fraction 0
+    --max-per-species 10 --max-genome-weight-bp 50000 --holdout-fraction 0 \
+    --blast-screen --blast-jobs 32        # v4 only; v3 was built without these two flags
 ```
 
 Requirements:
 - `numpy`
 - `zstandard` (or the `zstd` binary)
 - the NCBI `datasets` CLI, for the `ncbi_virus` source
+- BLAST+ (`blastn`, `makeblastdb`), for `--blast-screen`. Pass `--blast-bin DIR` if they are not on `PATH`.
 
-On the cluster, use `build_corpus.slurm`.
+On the cluster, use `build_corpus.slurm`. It reuses the existing `/save/corpus_raw` without downloading again, and builds v4 with the BLAST screen on 32 cores in about 2–2.5 h.
 
 ## Sources
 
@@ -55,7 +59,28 @@ The species is the lineage entry below the genus in each genome's `data_report.j
    | `anello_unseen_strict` | all windows | anellovirus positives in `test_data_anell_300_binary` | 15 | 447 |
 
    Anelloviruses are removed by taxonomy, by the header regex (`anellovir|torque teno|TTV|…`) and by this screen. That keeps the anell test an unseen-family benchmark.
-5. **Write.** Trim each category to its target, shuffle, and write `pretrain_corpus_000…003.csv` (1M rows each) plus `manifest.json`. v3 has no holdout file.
+
+4b. **BLAST screen (`--blast-screen`, v4 only).** This step removes close homologs of the test reads. It runs after the k-mer screens, on the windows they keep, in every category including ViraMiner.
+   - **Search:** the 26,405 `fullset_test` reads form a blastn database, and every corpus window is a query. Parameters: `-task blastn -word_size 7 -evalue 1e-3 -strand both -dust yes -max_target_seqs 500`.
+   - **Rule:** a window is dropped if, for at least one test read, its HSPs with identity > 70% and E ≤ 1e-3 cover at least 80% of that read (≥ 240 of 300 bp).
+     - Coverage is the union of the HSP intervals on the test read, counted per strand. Two partial alignments that together span the read therefore count.
+     - Options to change it: `--blast-identity`, `--blast-coverage`, `--blast-evalue`, `--blast-word-size`, and `--blast-categories` to choose which categories are screened.
+   - **E-value:** E depends on database size, so it is not comparable to the opposite search direction (test reads against a corpus database). With this small database the same alignment gets a ~100× smaller E. That doesn't matter here: any alignment covering ≥ 240 bp at > 70% identity is far below 1e-3, so the coverage and identity thresholds decide.
+   - **Output:** every dropped window is written to `blast_screen_hits.csv` together with the test read that removed it, the coverage, the best identity and the E-value. The manifest records the rule and the number removed per category, under `windows_screened_out`, `<category>:blast_fullset_test`.
+   - **Expected effect,** from a local pilot on 20,000 v3 windows:
+
+     | Category | Dropped |
+     |---|---|
+     | human | 12.8% |
+     | viraminer | 2.2% |
+     | virus_eukaryotic | 0.03% |
+     | virus_prokaryotic | 0.02% |
+     | bacteria | 0% |
+
+     The human windows are not copies of test reads. Each one matches a median of 5 different non-viral test reads at about 83% identity, which points to shared repeat families. Every category is drawn at 1.3× its target, so all of them still reach their targets after this step.
+   - **Cost:** 31.8 windows/s per core, about 45 core-hours for the ~5.1M windows left after the k-mer screens.
+
+5. **Write.** Trim each category to its target, shuffle, and write `pretrain_corpus_000…003.csv` (1M rows each) plus `manifest.json`, and `blast_screen_hits.csv` when the BLAST screen ran. v3 has no holdout file.
 
 **Window ID format:** `category|source|record|start|strand`, for example `human|human|chr1|217010|+`.
 
@@ -63,6 +88,7 @@ The species is the lineage entry below the genus in each genome's `data_report.j
 
 - `refseq_viral` includes plant and insect viruses. `uhgv` is labelled phage as a whole, but contains some eukaryotic gut viruses.
 - The species cap is taxonomic, not sequence clustering, so near-identical strains of one species can still repeat.
+- In v4, the BLAST screen removes repeat-rich human windows, so the human category has fewer repeats than the genome itself. To leave human windows out of the BLAST screen, pass `--blast-categories virus_eukaryotic,virus_prokaryotic,bacteria,viraminer`.
 - All bacteria come from the gut (UHGG). There are no skin or cervical genomes, although ViraMiner samples include those sites.
 - Sources not used:
   - IMG/VR: needs a JGI account and is mostly environmental.
