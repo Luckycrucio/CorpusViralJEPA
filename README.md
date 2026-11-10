@@ -3,8 +3,8 @@
 `build_corpus.py` builds an **unlabeled** corpus of 300 bp DNA windows for JEPA pretraining.
 The output uses the ViraMiner CSV format (`id,sequence,label`), with the label always `-1`.
 The numbers below come from **corpus_v3** (`corpus3_cluster/corpus_v3/manifest.json`).
-**corpus_v4** is the same recipe plus the BLAST screen (step 4b). Its numbers will be in
-`corpus_v4/manifest.json` once the cluster build finishes.
+**corpus_v4** is the same recipe plus the BLAST screen (step 4b). The section
+[corpus_v4: what BLASTn changed](#corpus_v4-what-blastn-changed) reports how it differs from v3.
 
 ## Usage
 
@@ -22,7 +22,6 @@ Requirements:
 - the NCBI `datasets` CLI, for the `ncbi_virus` source
 - BLAST+ (`blastn`, `makeblastdb`), for `--blast-screen`. Pass `--blast-bin DIR` if they are not on `PATH`.
 
-On the cluster, use `build_corpus.slurm`. It reuses the existing `/save/corpus_raw` without downloading again, and builds v4 with the BLAST screen on 32 cores in about 2–2.5 h.
 
 ## Sources
 
@@ -67,22 +66,32 @@ The species is the lineage entry below the genus in each genome's `data_report.j
      - Options to change it: `--blast-identity`, `--blast-coverage`, `--blast-evalue`, `--blast-word-size`, and `--blast-categories` to choose which categories are screened.
    - **E-value:** E depends on database size, so it is not comparable to the opposite search direction (test reads against a corpus database). With this small database the same alignment gets a ~100× smaller E. That doesn't matter here: any alignment covering ≥ 240 bp at > 70% identity is far below 1e-3, so the coverage and identity thresholds decide.
    - **Output:** every dropped window is written to `blast_screen_hits.csv` together with the test read that removed it, the coverage, the best identity and the E-value. The manifest records the rule and the number removed per category, under `windows_screened_out`, `<category>:blast_fullset_test`.
-   - **Expected effect,** from a local pilot on 20,000 v3 windows:
-
-     | Category | Dropped |
-     |---|---|
-     | human | 12.8% |
-     | viraminer | 2.2% |
-     | virus_eukaryotic | 0.03% |
-     | virus_prokaryotic | 0.02% |
-     | bacteria | 0% |
-
-     The human windows are not copies of test reads. Each one matches a median of 5 different non-viral test reads at about 83% identity, which points to shared repeat families. Every category is drawn at 1.3× its target, so all of them still reach their targets after this step.
-   - **Cost:** 31.8 windows/s per core, about 45 core-hours for the ~5.1M windows left after the k-mer screens.
+   - **Effect:** see [corpus_v4: what BLASTn changed](#corpus_v4-what-blastn-changed). Every category is drawn at 1.3× its target, so all of them still reach their targets after this step.
+   - **Cost:** in v4, 113 min on 32 cores for the 5.05M windows left after the k-mer screens (about 23 windows/s per blastn process).
 
 5. **Write.** Trim each category to its target, shuffle, and write `pretrain_corpus_000…003.csv` (1M rows each) plus `manifest.json`, and `blast_screen_hits.csv` when the BLAST screen ran. v3 has no holdout file.
 
 **Window ID format:** `category|source|record|start|strand`, for example `human|human|chr1|217010|+`.
+
+## corpus_v4: what BLASTn changed
+
+corpus_v4 was built on cluster taking 2 h 14 min (mostly for BLASTn), it's log and results are in `corpus4_cluster/corpus_v4/`. Up to the BLAST screen, the build is identical to v3: same raw files, record counts, targets and k-mer screen counts. Both corpora have 4,000,000 windows with the same total per category.
+
+| Category | Removed by BLAST in v4 | v3 windows that fail the rule | Removals caused by viral test reads | Windows shared with v3 |
+|---|---|---|---|---|
+| human | 161,897 | 134,065 (13.4%) | 0 | 83% |
+| viraminer | 4,231 | 4,108 (2.3%) | 424 | 97% |
+| virus_eukaryotic | 414 | 327 (0.05%) | 383 | 77% |
+| bacteria | 393 | 303 (0.04%) | 0 | 77% |
+| virus_prokaryotic | 145 | 122 (0.01%) | 73 | 77% |
+
+v3 and v4 draw from the same window pool, so each v3 window was checked against v4's `blast_screen_hits.csv`. That gives the "fail the rule" column. No v4 window fails the rule.
+
+- **Human:** these windows are repeat homologs, not copies of test reads. Median identity is 78% over 94% of the read. The removals come from 1,020 non-viral test reads, and a few reads account for most of them (the top one alone removes 14,087 windows). Only 571 hits are ≥ 95% identical. Mean GC barely changes (0.405 → 0.403), but v4's human category has fewer repeats than the genome itself.
+- **Eukaryotic viruses:** few in number, but these are the removals that matter for the viral task. 383 of the 414 come from viral test reads, at 70–83% identity, none ≥ 95%.
+- **ViraMiner:** 381 hits are ≥ 95% identical, i.e. pieces of the same contigs as the test reads.
+- **Overall:** 2,127 test reads caused at least one removal, and 160 of them are viral.
+- **v4 is not v3 minus the flagged windows.** After screening, each category is randomly trimmed to its target, and that draw differs from v3's. So only 77–83% of the genome-category windows are the same as in v3, and 97% of ViraMiner windows.
 
 ## Known limitations
 

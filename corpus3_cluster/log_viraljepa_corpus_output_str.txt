@@ -1,0 +1,46 @@
+Defaulting to user installation because normal site-packages is not writeable
+Requirement already satisfied: zstandard in /home/u0313/.local/lib/python3.11/site-packages (0.25.0)
+datasets version: 18.40.0
+[14:55:01] Downloading refseq_viral
+[14:55:02]   RefSeq viral: viral.1.1.genomic.fna.gz
+[14:55:02] Downloading ncbi_virus
+[14:55:02]   NCBI Virus: Papillomaviridae (host human, complete genomes)
+[14:55:12]   NCBI Virus: Polyomaviridae (host human, complete genomes)
+[14:55:18]   NCBI Virus: Anelloviridae (host human, complete genomes)
+[14:55:23]   NCBI Virus: Orthoherpesviridae (host human, complete genomes)
+[14:55:47]   NCBI Virus: Adenoviridae (host human, complete genomes)
+[14:56:09]   NCBI Virus: Parvoviridae (host human, complete genomes)
+[14:56:24]   NCBI Virus: Circoviridae (host human, complete genomes)
+[14:56:29]   NCBI Virus: Genomoviridae (host human, complete genomes)
+[14:56:31]   NCBI Virus: Hepadnaviridae (host human, complete genomes)
+[14:57:11]   NCBI Virus: Poxviridae (host human, complete genomes)
+[14:59:15]   NCBI Virus: Picornaviridae (host human, complete genomes)
+[14:59:55]   NCBI Virus: Caliciviridae (host human, complete genomes)
+[15:00:06]   NCBI Virus: Astroviridae (host human, complete genomes)
+[15:00:18]   NCBI Virus: Flaviviridae (host human, complete genomes)
+[15:00:39]   NCBI Virus: Human immunodeficiency virus 1 (host human, complete genomes)
+[15:02:00]   NCBI Virus: Human immunodeficiency virus 2 (host human, complete genomes)
+[15:02:08]   NCBI Virus: Primate T-lymphotropic virus 1 (host human, complete genomes)
+[15:02:11]   NCBI Virus: Primate T-lymphotropic virus 2 (host human, complete genomes)
+[15:02:16] Downloading uhgv
+[15:02:16]   UHGV: votus_full.fna.zst
+[15:02:16]   UHGV: votus_metadata_extended.tsv.zst
+[15:02:16] Downloading uhgg
+[15:02:18]   UHGG: 1000 species representatives from 20 phyla
+[15:02:18] Downloading human
+[15:02:18]   Human: T2T-CHM13v2.0 analysis set
+[15:02:18] Downloads complete
+[15:02:18] Indexing sources
+[15:02:27]   refseq_viral: 19,275 records, 580.0 Mbp
+[15:02:32]   ncbi_virus: 1,266 records, 33.3 Mbp
+[15:02:33]   UHGV: 57734 vOTU representatives pass quality ['Complete', 'High-quality']
+[15:02:41]   uhgv: 57,734 records, 2,598.1 Mbp
+[15:02:48]   uhgg: 92,449 records, 2,611.7 Mbp
+[15:03:22]   human: 25 records, 3,117.3 Mbp
+[15:03:22] Targets: {'virus_eukaryotic': 720000, 'virus_prokaryotic': 1300000, 'human': 1000000, 'bacteria': 800000, 'viraminer': 180000}
+[15:04:05]   screen 'evaluation_standard': k=31, min shared fraction=0.1, 19,886,226 k-mers
+[15:04:18]   screen 'anell_test_overlap': k=31, min shared fraction=0.1, 7,305,791 k-mers
+[15:04:18]   screen 'anello_unseen_strict': k=15, min shared fraction=0.1, 248,713 k-mers
+[15:04:19] Sampling windows from 164,385 records
+[15:06:00] Strand flipping, optional noise, screening, trimming to targets
+[15:32:15] Wrote 4,000,000 training + 0 holdout windows to /save/corpus_v3

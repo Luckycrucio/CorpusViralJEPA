@@ -1,3 +1,5 @@
 __pycache__/
+corpus_raw/
 *.pyc
 *.slurm
+*.csv

@@ -1,0 +1,164 @@
+{
+  "created": "2026-11-09 17:42:20",
+  "arguments": {
+    "command": "build",
+    "raw_dir": "/save/corpus_raw",
+    "viraminer_dir": "/data",
+    "out_dir": "/save/corpus_v4",
+    "sources": "refseq_viral,ncbi_virus,uhgv,uhgg,human",
+    "num_windows": "4000000",
+    "mix": "virus_eukaryotic=0.18,virus_prokaryotic=0.325,human=0.25,bacteria=0.20,viraminer=0.045",
+    "screen": "standard",
+    "exclude_anelloviridae": "True",
+    "blast_screen": "True",
+    "blast_identity": "70.0",
+    "blast_coverage": "0.8",
+    "blast_evalue": "0.001",
+    "blast_word_size": "7",
+    "blast_categories": "virus_eukaryotic,virus_prokaryotic,human,bacteria,viraminer",
+    "blast_jobs": "32",
+    "blast_chunk": "2000",
+    "blast_bin": "/save/bin/ncbi-blast-2.17.0+/bin",
+    "uhgv_quality": "Complete,High-quality",
+    "max_per_species": "10",
+    "max_genome_weight_bp": "50000",
+    "oversample": "1.3",
+    "substitution_rate": "0.0",
+    "noise_fraction": "0.5",
+    "holdout_fraction": "0.0",
+    "shard_size": "1000000",
+    "seed": "0"
+  },
+  "window_length": 300,
+  "targets": {
+    "virus_eukaryotic": 720000,
+    "virus_prokaryotic": 1300000,
+    "human": 1000000,
+    "bacteria": 800000,
+    "viraminer": 180000
+  },
+  "windows_per_category": {
+    "virus_eukaryotic": 720000,
+    "virus_prokaryotic": 1300000,
+    "human": 1000000,
+    "bacteria": 800000,
+    "viraminer": 180000
+  },
+  "holdout_windows": 0,
+  "shards": [
+    "pretrain_corpus_000.csv",
+    "pretrain_corpus_001.csv",
+    "pretrain_corpus_002.csv",
+    "pretrain_corpus_003.csv"
+  ],
+  "records_per_source": {
+    "refseq_viral": 19275,
+    "ncbi_virus": 1266,
+    "uhgv": 57734,
+    "uhgg": 92449,
+    "human": 25
+  },
+  "megabases_per_source": {
+    "refseq_viral": 580.01,
+    "ncbi_virus": 33.26,
+    "uhgv": 2598.07,
+    "uhgg": 2611.73,
+    "human": 3117.29
+  },
+  "excluded_anelloviridae": {
+    "refseq_viral": 175,
+    "ncbi_virus_family_files": 1,
+    "uhgv": 927
+  },
+  "capped_per_species": {
+    "ncbi_virus": 53487
+  },
+  "refseq_also_in_ncbi_virus": {
+    "refseq_viral": 139
+  },
+  "species_from_header_name": {},
+  "windows_rejected_n_or_short": {
+    "virus_eukaryotic": 1366,
+    "virus_prokaryotic": 4,
+    "human": 0,
+    "bacteria": 46
+  },
+  "windows_screened_out": {
+    "virus_eukaryotic:evaluation_standard": 970,
+    "virus_eukaryotic:anello_unseen_strict": 55,
+    "virus_eukaryotic:blast_fullset_test": 414,
+    "virus_prokaryotic:evaluation_standard": 534,
+    "virus_prokaryotic:anello_unseen_strict": 7,
+    "virus_prokaryotic:blast_fullset_test": 145,
+    "human:evaluation_standard": 93397,
+    "human:anello_unseen_strict": 116,
+    "human:blast_fullset_test": 161897,
+    "bacteria:evaluation_standard": 439,
+    "bacteria:anello_unseen_strict": 5,
+    "bacteria:blast_fullset_test": 393,
+    "viraminer:anell_test_overlap": 25829,
+    "viraminer:anello_unseen_strict": 264,
+    "viraminer:blast_fullset_test": 4231
+  },
+  "screens": {
+    "external_genomes": [
+      {
+        "name": "evaluation_standard",
+        "type": "kmer",
+        "k": 31,
+        "min_fraction": 0.1,
+        "kmers": 19886226
+      },
+      {
+        "name": "anello_unseen_strict",
+        "type": "kmer",
+        "k": 15,
+        "min_fraction": 0.1,
+        "kmers": 248713
+      }
+    ],
+    "viraminer_train": [
+      {
+        "name": "anell_test_overlap",
+        "type": "kmer",
+        "k": 31,
+        "min_fraction": 0.1,
+        "kmers": 7305791
+      },
+      {
+        "name": "anello_unseen_strict",
+        "type": "kmer",
+        "k": 15,
+        "min_fraction": 0.1,
+        "kmers": 248713
+      }
+    ],
+    "blast": {
+      "name": "blast_fullset_test",
+      "type": "blastn",
+      "blastn": "blastn: 2.17.0+",
+      "database": "fullset_test.csv",
+      "reads": 26405,
+      "categories": [
+        "bacteria",
+        "human",
+        "viraminer",
+        "virus_eukaryotic",
+        "virus_prokaryotic"
+      ],
+      "rule": "drop a window if its HSPs with identity > 70% and E-value <= 0.001 cover >= 0.8 of one test read",
+      "word_size": 7,
+      "strand": "both",
+      "dust": "yes",
+      "max_target_seqs": 500
+    }
+  },
+  "sources": {
+    "refseq_viral": "https://ftp.ncbi.nlm.nih.gov/refseq/release/viral/",
+    "ncbi_virus": "NCBI datasets CLI, host=human, complete genomes",
+    "uhgv": "https://zenodo.org/api/records/17402089/files/votus_full.fna.zst/content",
+    "uhgg": "https://ftp.ebi.ac.uk/pub/databases/metagenomics/mgnify_genomes/human-gut/v2.0.2/",
+    "human": "https://s3-us-west-2.amazonaws.com/human-pangenomics/T2T/CHM13/assemblies/analysis_set/chm13v2.0.fa.gz"
+  },
+  "minutes": 134.0
+}
