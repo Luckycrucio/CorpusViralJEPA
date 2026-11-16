@@ -5,6 +5,8 @@ The output uses the ViraMiner CSV format (`id,sequence,label`), with the label a
 The numbers below come from **corpus_v3** (`corpus3_cluster/corpus_v3/manifest.json`).
 **corpus_v4** is the same recipe plus the BLAST screen (step 4b). The section
 [corpus_v4: what BLASTn changed](#corpus_v4-what-blastn-changed) reports how it differs from v3.
+**corpus_v5** (recipe ready, not built yet) replaces v4's BLAST drop rule with the one in
+[corpus_v5: the new BLAST rule](#corpus_v5-the-new-blast-rule).
 
 ## Usage
 
@@ -14,6 +16,8 @@ python build_corpus.py build --raw-dir RAW --viraminer-dir dataset/ --out-dir OU
     --mix virus_eukaryotic=0.18,virus_prokaryotic=0.325,human=0.25,bacteria=0.20,viraminer=0.045 \
     --max-per-species 10 --max-genome-weight-bp 50000 --holdout-fraction 0 \
     --blast-screen --blast-jobs 32        # v4 only; v3 was built without these two flags
+# v5: same command, plus
+#   --blast-rule informative --blast-homology-labels 1 --mask-min-informative 0
 ```
 
 Requirements:
@@ -93,11 +97,80 @@ v3 and v4 draw from the same window pool, so each v3 window was checked against 
 - **Overall:** 2,127 test reads caused at least one removal, and 160 of them are viral.
 - **v4 is not v3 minus the flagged windows.** After screening, each category is randomly trimmed to its target, and that draw differs from v3's. So only 77–83% of the genome-category windows are the same as in v3, and 97% of ViraMiner windows.
 
+## corpus_v5: the new BLAST rule
+
+corpus_v5 is not built yet. `build_corpus.slurm` writes it to `/save/corpus_v5`. The numbers in this
+section come from local pilots (28,230 human + 2,960 ViraMiner windows, the same windows under each rule).
+
+**The rule, as the recipe runs it.** The BLAST search is the same as in v4. A window is dropped if, for
+one test read and one strand, either
+
+- its HSPs (identity > 70%, E ≤ 1e-3) cover at least 150 bp of a **viral** test read, or
+- its HSPs with identity ≥ 95% cover at least 80% of **any** test read (near-duplicate).
+
+Compared with v4 (HSPs cover ≥ 80% of any test read): stricter against the 551 viral reads (150 bp
+instead of 240 bp), and against the 25,854 non-viral reads only near-identical copies are removed.
+Homology between a corpus window and a non-viral test read (shared Alu, L1 or satellite families) is not
+leakage for viral classification, so the human category keeps its repeats at the genome's natural level,
+as in v3.
+
+The rest of this section explains how the code gets there. The rule was first designed as
+"specificity-weighted coverage", with a repeat mask on the test reads; the mask turned out to have no
+effect on this test set, and the recipe's flags reduce the rule to the two lines above.
+
+**What `--blast-rule informative` does in general.** The BLAST search is the same as in v4. Two things change:
+
+- **Stage 0, informativeness mask.** Every canonical 31-mer of every `fullset_test` read is counted in a
+  random 10% of T2T-CHM13 (1 kb blocks, both strands; `--mask-background human,uhgg` adds the UHGG genomes).
+  A read base is *informative* if at least one 31-mer covering it was seen fewer than 50 times
+  (`--mask-max-copies`), otherwise *generic*. Reads with fewer than 60 informative bp
+  (`--mask-min-informative`) are left out of the BLAST database. The mask is written to
+  `informative_mask.csv` (one row per test read) and takes about 2 min.
+- **Drop rule.** A window is dropped if, for one test read and one strand, either
+  - its HSPs (identity > 70%, E ≤ 1e-3) cover at least 150 informative bp of the read
+    (`--blast-informative-bp`), or
+  - its HSPs with identity ≥ 95% cover at least 80% of the read (near-duplicate, whatever the repeat
+    content; `--blast-dup-identity`, `--blast-coverage`).
+
+  `blast_screen_hits.csv` gains two columns: `rule` (`informative` or `near_duplicate`) and `informative_bp`.
+
+**The mask does not separate repeats in this test set.** The rule was designed on the assumption that
+repeat-derived reads are made of high-copy 31-mers. Measured on `fullset_test`:
+
+- 25,712 of the 25,854 non-viral reads and all 551 viral reads are 100% informative; 4 reads fall below 60 bp.
+- Only 6,050 of the 7,078,006 distinct read 31-mers reach 50 sampled copies.
+- The reads that removed human windows in v4 are diverged repeat copies: blastn finds thousands of
+  homologs at ~78% identity, but their exact 31-mers are single-copy. The read that removed the most
+  windows (14,010) has a median 31-mer count of 0.
+- Other settings do not fix it. With k = 13, 16 or 20 and thresholds from 5 to 200, any setting that
+  frees most human windows also makes the viral reads generic.
+
+So the informative-bp rule is close to "HSPs cover ≥ 150 bp of the read", which is stricter than v4:
+
+| Pilot, same windows | human removed (of 28,230) | viraminer removed (of 2,960) |
+|---|---|---|
+| v4 rule (`--blast-rule coverage`) | 3,771 (13.4%) | 52 |
+| v5 rule, all test reads | 7,360 (26.1%) | 201 |
+| v5 rule, `--blast-homology-labels 1` | 0 | 19 (14 from viral reads, 5 near-duplicates) |
+
+At full scale, 26% is about 315,000 human windows. Only 206,000 spare human windows are drawn, so the
+human category would end near 890,000, below its 1,000,000 target.
+
+**The two flags the recipe adds.**
+
+- `--blast-homology-labels 1`: the informative-bp rule is applied only against the 551 viral test reads;
+  the near-duplicate rule still uses every test read. All viral reads are 100% informative, so
+  "150 informative bp" is simply 150 bp. To build with the rule against all reads, remove this flag and
+  raise `--oversample` to about 1.5 so human reaches its target.
+- `--mask-min-informative 0`: no read is left out of the database. With the default of 60, the 4
+  pure-repeat reads would be skipped and near-duplicates of them would not be checked.
+
 ## Known limitations
 
 - `refseq_viral` includes plant and insect viruses. `uhgv` is labelled phage as a whole, but contains some eukaryotic gut viruses.
 - The species cap is taxonomic, not sequence clustering, so near-identical strains of one species can still repeat.
 - In v4, the BLAST screen removes repeat-rich human windows, so the human category has fewer repeats than the genome itself. To leave human windows out of the BLAST screen, pass `--blast-categories virus_eukaryotic,virus_prokaryotic,bacteria,viraminer`.
+- In v5, the informativeness mask has no effect on the result (see the v5 section); what keeps the human repeats in the corpus is `--blast-homology-labels 1`. The mask is still computed (about 2 min) and written to `informative_mask.csv`.
 - All bacteria come from the gut (UHGG). There are no skin or cervical genomes, although ViraMiner samples include those sites.
 - Sources not used:
   - IMG/VR: needs a JGI account and is mostly environmental.

@@ -480,25 +480,152 @@ def sequence_number(token):
     return int(re.search(r"(\d+)\D*$", token).group(1))
 
 
-def covered_length(intervals):
-    """Number of positions covered by a list of closed (start, end) intervals."""
+def merge_intervals(intervals):
+    """Union of closed (start, end) intervals, as a sorted list of disjoint closed intervals."""
+    if not intervals:
+        return []
     intervals = sorted(intervals)
-    total, (start, end) = 0, intervals[0]
+    merged, (start, end) = [], intervals[0]
     for a, b in intervals[1:]:
         if a > end + 1:
-            total += end - start + 1
+            merged.append((start, end))
             start, end = a, b
         else:
             end = max(end, b)
-    return total + end - start + 1
+    merged.append((start, end))
+    return merged
+
+
+def covered_length(intervals):
+    """Number of positions covered by a list of closed (start, end) intervals."""
+    return sum(b - a + 1 for a, b in merge_intervals(intervals))
+
+
+MASK_BACKGROUNDS = {"human": ("human", "*.fa.gz"), "uhgg": ("uhgg/genomes", "*.fna")}
+
+
+def background_counts(kmers, k, raw_dir, backgrounds, fraction, seed, block=1000, batch=20000):
+    """Occurrences of each k-mer of the sorted array `kmers` in a random sample of the background.
+
+    Each background sequence is cut into `block`-bp blocks and a block is scanned with probability
+    `fraction`; every k-mer that starts in a scanned block is counted, on both strands. Counts
+    are therefore about `fraction` x the true copy number. Contig tails shorter than a block and
+    k-mers with non-ACGT bases are not counted.
+    """
+    # Own generator: the mask must not shift the random stream that samples the corpus windows.
+    rng = np.random.default_rng([seed, k])
+    counts = np.zeros(len(kmers), dtype=np.int64)
+    scanned = Counter()
+
+    def scan(rows):
+        valid = (rows < 4).astype(np.int32)
+        valid = np.concatenate([np.zeros((len(rows), 1), np.int32), np.cumsum(valid, 1, dtype=np.int32)], 1)
+        valid = (valid[:, k:] - valid[:, :-k]) == k
+        queries = kmer_codes(np.where(rows < 4, rows, 0), k)[valid]
+        position = np.searchsorted(kmers, queries).clip(max=len(kmers) - 1)
+        position = position[kmers[position] == queries]
+        return np.bincount(position, minlength=len(kmers))
+
+    for name in backgrounds:
+        folder, pattern = MASK_BACKGROUNDS[name]
+        paths = sorted((Path(raw_dir) / folder).glob(pattern))
+        if not paths:
+            raise RuntimeError(f"mask background '{name}' not found in {Path(raw_dir) / folder}")
+        pending, pending_rows = [], 0
+
+        def flush():
+            nonlocal pending, pending_rows, counts
+            if pending:
+                counts += scan(np.concatenate(pending))
+            pending, pending_rows = [], 0
+
+        for path in paths:
+            for _, sequence in read_fasta(path):
+                raw = CODE[np.frombuffer(sequence.encode(), dtype=np.uint8)]
+                blocks = (len(raw) - (k - 1)) // block
+                if blocks <= 0:
+                    continue
+                starts = np.flatnonzero(rng.random(blocks) < fraction) * block
+                scanned[name] += len(starts) * block
+                view = np.lib.stride_tricks.sliding_window_view(raw, block + k - 1)
+                for first in range(0, len(starts), batch):
+                    pending.append(view[starts[first : first + batch]])
+                    pending_rows += len(pending[-1])
+                    if pending_rows >= batch:
+                        flush()
+        flush()
+        log(f"    mask background '{name}': {scanned[name] / 1e6:,.1f} Mbp scanned")
+    return counts, dict(scanned)
+
+
+class InformativeMask:
+    """Stage 0 of the specificity-weighted BLAST rule: which bases of each test read are informative.
+
+    A base is informative if at least one canonical k-mer covering it occurs fewer than max_copies
+    times in the sampled background; otherwise it is generic (repeat). `cumulative[r, i]` is the
+    number of informative bases among the first i bases of read r.
+    """
+
+    def __init__(self, rows, args):
+        self.k = args.mask_k
+        self.max_copies = args.mask_max_copies
+        self.fraction = args.mask_sample_fraction
+        self.backgrounds = args.mask_background.split(",")
+        unknown = set(self.backgrounds) - set(MASK_BACKGROUNDS)
+        if unknown:
+            raise ValueError(f"unknown --mask-background {sorted(unknown)}, expected some of {sorted(MASK_BACKGROUNDS)}")
+        k = self.k
+        length = max(len(row[1]) for row in rows)
+        codes = np.full((len(rows), length), 4, dtype=np.uint8)
+        for index, row in enumerate(rows):
+            codes[index, : len(row[1])] = CODE[np.frombuffer(row[1].encode(), dtype=np.uint8)]
+        valid = np.lib.stride_tricks.sliding_window_view(codes < 4, k, axis=1).all(2)
+        read_kmers = kmer_codes(np.where(codes < 4, codes, 0), k)
+        table = np.unique(read_kmers[valid])
+        log(f"  informativeness mask: {len(table):,} distinct {k}-mers in {len(rows):,} reads, background "
+            f"{'+'.join(self.backgrounds)} sampled at {self.fraction:g}x")
+        counts, self.scanned = background_counts(table, k, args.raw_dir, self.backgrounds, self.fraction, args.seed)
+        # A k-mer with a non-ACGT base cannot be counted, so it never makes a base informative.
+        specific = valid & (counts[np.searchsorted(table, read_kmers).clip(max=len(table) - 1)] < self.max_copies)
+        change = np.zeros((len(rows), length + 1), dtype=np.int32)
+        change[:, : specific.shape[1]] += specific
+        change[:, k:] -= specific
+        self.mask = np.cumsum(change, 1)[:, :length] > 0
+        self.cumulative = np.concatenate([np.zeros((len(rows), 1), np.int32), np.cumsum(self.mask, 1, dtype=np.int32)], 1)
+        self.informative = self.cumulative[:, -1]
+        self.repeat_kmers = int((counts >= self.max_copies).sum())
+        self.kmers = int(len(table))
+
+    def overlap(self, read, intervals):
+        """Informative bases of `read` inside disjoint closed 1-based intervals."""
+        row = self.cumulative[read]
+        return int(sum(row[b] - row[a - 1] for a, b in intervals))
+
+    def intervals(self, read):
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], self.mask[read].astype(np.int8), [0]])))
+        return ";".join(f"{a + 1}-{b}" for a, b in zip(edges[::2], edges[1::2]))
+
+    def describe(self):
+        return {"k": self.k, "max_copies": self.max_copies, "background": self.backgrounds,
+                "sample_fraction": self.fraction, "megabases_scanned": {n: round(v / 1e6, 1) for n, v in self.scanned.items()},
+                "distinct_read_kmers": self.kmers, "read_kmers_at_or_above_max_copies": self.repeat_kmers}
 
 
 class BlastScreen:
-    """Drop windows whose blastn alignments cover most of an evaluation read.
+    """Drop windows whose blastn alignments to an evaluation read amount to leakage.
 
-    The evaluation reads are the database and the corpus windows are the queries. A window is
-    dropped if, for at least one read, its HSPs with identity > min_identity and E-value <= evalue
-    cover at least min_coverage of that read (union of the HSP intervals on the read, per strand).
+    The evaluation reads are the database and the corpus windows are the queries. For each
+    (window, read, strand), C is the union on the read of the HSPs with identity > min_identity
+    and E-value <= evalue. Two rules (--blast-rule):
+
+    coverage (corpus_v4): drop if C covers at least min_coverage of the read.
+
+    informative (corpus_v5, specificity-weighted coverage): drop if C covers at least
+    informative_bp informative bases of the read (see InformativeMask), or if the HSPs with
+    identity >= dup_identity alone cover at least min_coverage of the read (near-duplicate, whatever
+    the repeat content). Reads with fewer than min_informative informative bases are left out of
+    the database.
+
     Every dropped window is listed in blast_screen_hits.csv with the read that removed it.
     """
 
@@ -520,25 +647,63 @@ class BlastScreen:
         self.read_ids = [row[0] for row in rows]
         self.read_labels = [row[2] for row in rows]
         self.read_lengths = np.array([len(row[1]) for row in rows])
+        self.rule = args.blast_rule
+        self.informative_bp = args.blast_informative_bp
+        self.dup_identity = args.blast_dup_identity
+        self.min_informative = args.mask_min_informative
+        # Reads the informative-bp rule applies to; the near-duplicate rule always applies to all reads.
+        self.homology_labels = sorted(set(args.blast_homology_labels.split(",")) - {""})
+        self.homology = np.array([not self.homology_labels or label in self.homology_labels for label in self.read_labels])
+        self.mask = None
+        in_database = np.ones(len(rows), dtype=bool)
+        if self.rule == "informative":
+            self.mask = InformativeMask(rows, args)
+            in_database = self.mask.informative >= self.min_informative
+            with open(Path(args.out_dir) / "informative_mask.csv", "w") as out:
+                out.write("test_id,test_label,length,informative_bp,in_database,informative_intervals\n")
+                for index, row in enumerate(rows):
+                    out.write(f"{row[0]},{row[2]},{len(row[1])},{self.mask.informative[index]},"
+                              f"{int(in_database[index])},{self.mask.intervals(index)}\n")
+            for label in sorted(set(self.read_labels)):
+                chosen = np.array([l == label for l in self.read_labels])
+                log(f"    label {label}: {int(chosen.sum()):,} reads, median {int(np.median(self.mask.informative[chosen]))} "
+                    f"informative bp, {int((chosen & ~in_database).sum()):,} left out of the database "
+                    f"(< {self.min_informative} informative bp)")
+        self.database_reads = int(in_database.sum())
 
         self.work = Path(args.out_dir) / "blast_screen_work"
         self.work.mkdir(parents=True, exist_ok=True)
         fasta = self.work / "evaluation.fa"
         with open(fasta, "w") as out:
             for index, row in enumerate(rows):
-                out.write(f">lcl|t{index}\n{row[1]}\n")
+                if in_database[index]:
+                    out.write(f">lcl|t{index}\n{row[1]}\n")
         self.db = self.work / "evaluation"
         command = [find_blast_tool("makeblastdb", args.blast_bin), "-in", str(fasta), "-dbtype", "nucl",
                    "-parse_seqids", "-out", str(self.db)]
         subprocess.run(command, check=True, capture_output=True)
         self.report = open(Path(args.out_dir) / "blast_screen_hits.csv", "w")
-        self.report.write("window_id,test_id,test_label,read_coverage,max_identity,min_evalue\n")
-        log(f"  screen '{name}': {self.version}, {len(rows):,} reads, identity > {self.min_identity:g}%, "
-            f"read coverage >= {self.min_coverage:g}, E <= {self.evalue:g}, word size {self.word_size}, "
-            f"{self.jobs} blastn processes")
+        if self.rule == "informative":
+            self.report.write("window_id,test_id,test_label,rule,informative_bp,read_coverage,max_identity,min_evalue\n")
+        else:
+            self.report.write("window_id,test_id,test_label,read_coverage,max_identity,min_evalue\n")
+        log(f"  screen '{name}': {self.version}, {self.database_reads:,} of {len(rows):,} reads in the database, "
+            f"{self.rule_text()}, word size {self.word_size}, {self.jobs} blastn processes")
+
+    def rule_text(self):
+        hsps = f"HSPs with identity > {self.min_identity:g}% and E-value <= {self.evalue:g}"
+        if self.rule == "informative":
+            reads = f"test read with label {'/'.join(self.homology_labels)}" if self.homology_labels else "test read"
+            return (f"drop a window if its {hsps} cover >= {self.informative_bp} informative bp of one {reads}, "
+                    f"or if its HSPs with identity >= {self.dup_identity:g}% cover >= {self.min_coverage:g} of any test read")
+        return f"drop a window if its {hsps} cover >= {self.min_coverage:g} of one test read"
 
     def search(self, windows, offset):
-        """Run blastn on one chunk; return {window index: (coverage, read, identity, E-value)}."""
+        """Run blastn on one chunk; return {window index: (score, report fields)} for the dropped windows.
+
+        The reported read is the one with the highest score: read coverage under the coverage rule,
+        informative bp covered under the informative rule (near-duplicates rank above all others).
+        """
         fasta = self.work / f"windows_{offset}.fa"
         table = self.work / f"windows_{offset}.tsv"
         with open(fasta, "w") as out:
@@ -562,9 +727,24 @@ class BlastScreen:
                     spans[key].append((min(start, end), max(start, end), identity, evalue))
         best = {}
         for (window, read, _), hsps in spans.items():
-            coverage = covered_length([(a, b) for a, b, _, _ in hsps]) / self.read_lengths[read]
-            if coverage >= self.min_coverage and coverage > best.get(window, (0.0,))[0]:
-                best[window] = (coverage, read, max(h[2] for h in hsps), min(h[3] for h in hsps))
+            union = merge_intervals([(a, b) for a, b, _, _ in hsps])
+            coverage = sum(b - a + 1 for a, b in union) / self.read_lengths[read]
+            identity, evalue = max(h[2] for h in hsps), min(h[3] for h in hsps)
+            if self.rule == "coverage":
+                if coverage < self.min_coverage:
+                    continue
+                score, fields = coverage, f"{coverage:.3f},{identity:.2f},{evalue:.3g}"
+            else:
+                informative = self.mask.overlap(read, union) if self.homology[read] else 0
+                close = covered_length([(a, b) for a, b, i, _ in hsps if i >= self.dup_identity] or [(1, 0)])
+                duplicate = close / self.read_lengths[read] >= self.min_coverage
+                if informative < self.informative_bp and not duplicate:
+                    continue
+                reason = "informative" if informative >= self.informative_bp else "near_duplicate"
+                score = (duplicate, informative, coverage)
+                fields = f"{reason},{informative},{coverage:.3f},{identity:.2f},{evalue:.3g}"
+            if window not in best or score > best[window][0]:
+                best[window] = (score, f"{self.read_ids[read]},{self.read_labels[read]},{fields}")
         fasta.unlink()
         table.unlink()
         return best
@@ -578,10 +758,9 @@ class BlastScreen:
             futures = [pool.submit(self.search, windows[s : s + self.chunk], s)
                        for s in range(0, len(windows), self.chunk)]
             for done, future in enumerate(as_completed(futures), 1):
-                for window, (coverage, read, identity, evalue) in future.result().items():
+                for window, (_, fields) in future.result().items():
                     hit[window] = True
-                    self.report.write(f"{ids[window]},{self.read_ids[read]},{self.read_labels[read]},"
-                                      f"{coverage:.3f},{identity:.2f},{evalue:.3g}\n")
+                    self.report.write(f"{ids[window]},{fields}\n")
                 if done % max(1, len(futures) // 10) == 0 or done == len(futures):
                     elapsed = time.time() - started
                     log(f"    blastn {done}/{len(futures)} chunks, {int(hit.sum()):,} windows hit, "
@@ -594,11 +773,16 @@ class BlastScreen:
         shutil.rmtree(self.work, ignore_errors=True)
 
     def describe(self):
-        return {"name": self.name, "type": "blastn", "blastn": self.version, "database": "fullset_test.csv",
-                "reads": len(self.read_ids), "categories": sorted(self.categories),
-                "rule": f"drop a window if its HSPs with identity > {self.min_identity:g}% and E-value <= "
-                        f"{self.evalue:g} cover >= {self.min_coverage:g} of one test read",
-                "word_size": self.word_size, "strand": "both", "dust": "yes", "max_target_seqs": 500}
+        description = {"name": self.name, "type": "blastn", "blastn": self.version, "database": "fullset_test.csv",
+                       "reads": len(self.read_ids), "reads_in_database": self.database_reads,
+                       "categories": sorted(self.categories), "rule": self.rule_text(),
+                       "word_size": self.word_size, "strand": "both", "dust": "yes", "max_target_seqs": 500}
+        if self.mask is not None:
+            description["informative_mask"] = dict(
+                self.mask.describe(), min_informative_bp=self.min_informative,
+                reads_left_out=len(self.read_ids) - self.database_reads,
+                median_informative_bp=int(np.median(self.mask.informative)))
+        return description
 
 
 def read_viraminer(path):
@@ -873,8 +1057,32 @@ def parse_args():
     build.add_argument(
         "--blast-screen",
         action="store_true",
-        help="also drop windows that blastn-align to fullset_test over most of a read (needs BLAST+)",
+        help="also drop windows that blastn-align to fullset_test (needs BLAST+); see --blast-rule",
     )
+    build.add_argument(
+        "--blast-rule",
+        choices=("coverage", "informative"),
+        default="coverage",
+        help="coverage (v4): HSPs cover --blast-coverage of a test read. informative (v5): HSPs cover "
+        "--blast-informative-bp non-repeat bases of a test read, or the read is a near-duplicate",
+    )
+    build.add_argument("--blast-informative-bp", type=int, default=150,
+                       help="informative rule: informative bases of the read the HSPs must cover")
+    build.add_argument("--blast-dup-identity", type=float, default=95.0,
+                       help="informative rule: HSPs with at least this identity (%%) covering --blast-coverage "
+                       "of the read drop the window whatever the repeat content")
+    build.add_argument("--blast-homology-labels", default="",
+                       help="informative rule: comma list of test labels the informative-bp rule applies to "
+                       "(1 = viral reads only); empty = all reads. The near-duplicate rule always uses all reads")
+    build.add_argument("--mask-background", default="human",
+                       help="informative rule: comma list of backgrounds for the k-mer counts (human, uhgg)")
+    build.add_argument("--mask-k", type=int, default=31)
+    build.add_argument("--mask-max-copies", type=int, default=50,
+                       help="a k-mer seen at least this often in the sampled background is generic")
+    build.add_argument("--mask-sample-fraction", type=float, default=0.1,
+                       help="fraction of the background scanned; --mask-max-copies applies to the sampled counts")
+    build.add_argument("--mask-min-informative", type=int, default=60,
+                       help="test reads with fewer informative bases are left out of the BLAST database")
     build.add_argument("--blast-identity", type=float, default=70.0, help="HSP identity must be above this (%%)")
     build.add_argument("--blast-coverage", type=float, default=0.8, help="fraction of the test read the HSPs must cover")
     build.add_argument("--blast-evalue", type=float, default=1e-3, help="HSP E-value must be at most this")
