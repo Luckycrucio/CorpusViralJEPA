@@ -5,8 +5,9 @@ The output uses the ViraMiner CSV format (`id,sequence,label`), with the label a
 The numbers below come from **corpus_v3** (`corpus3_cluster/corpus_v3/manifest.json`).
 **corpus_v4** is the same recipe plus the BLAST screen (step 4b). The section
 [corpus_v4: what BLASTn changed](#corpus_v4-what-blastn-changed) reports how it differs from v3.
-**corpus_v5** (recipe ready, not built yet) replaces v4's BLAST drop rule with the one in
-[corpus_v5: the new BLAST rule](#corpus_v5-the-new-blast-rule).
+**corpus_v5** replaces v4's BLAST drop rule with the one in
+[corpus_v5: the new BLAST rule](#corpus_v5-the-new-blast-rule); results are in
+[corpus_v5: results](#corpus_v5-results).
 
 ## Usage
 
@@ -99,8 +100,8 @@ v3 and v4 draw from the same window pool, so each v3 window was checked against 
 
 ## corpus_v5: the new BLAST rule
 
-corpus_v5 is not built yet. `build_corpus.slurm` writes it to `/save/corpus_v5`. The numbers in this
-section come from local pilots (28,230 human + 2,960 ViraMiner windows, the same windows under each rule).
+`build_corpus.slurm` writes corpus_v5 to `/save/corpus_v5`; for the full build see
+[corpus_v5: results](#corpus_v5-results). The numbers in this section come from local pilots (28,230 human + 2,960 ViraMiner windows, the same windows under each rule).
 
 **The rule, as the recipe runs it.** The BLAST search is the same as in v4. A window is dropped if, for
 one test read and one strand, either
@@ -165,12 +166,52 @@ human category would end near 890,000, below its 1,000,000 target.
 - `--mask-min-informative 0`: no read is left out of the database. With the default of 60, the 4
   pure-repeat reads would be skipped and near-duplicates of them would not be checked.
 
+## corpus_v5: results
+
+corpus_v5 was built on the cluster in 3 h 45 min, of which BLASTn took about 3 h 15 min on 16 processes. The log and output are in `corpus5_cluster/`.
+Up to the BLAST screen the build is identical to v4: same records, targets and k-mer screen counts. Every category reaches its target (4,000,000 windows).
+
+| Category | Removed by BLAST in v4 | Removed by BLAST in v5 | What the v5 removals are |
+|---|---|---|---|
+| human | 161,897 | 7 | 6 HERV-K windows, removed by one viral test read that is itself HERV-K; 1 `(AGCAG)n` near-duplicate |
+| virus_eukaryotic | 414 | 3,007 | 103 viral test reads, 511 genomes (2,331 windows from `ncbi_virus`); 70–80% identity over ≥ 150 bp |
+| virus_prokaryotic | 145 | 315 | homologs of viral test reads |
+| bacteria | 393 | 0 | v4 removed these for homology to non-viral reads, which v5 no longer checks |
+| viraminer | 4,231 | 1,181 | 862 viral homologs + 319 near-duplicates |
+
+The informativeness mask had no effect, as the pilot predicted: the median read has 300 informative bp, and no read was left out of the database.
+
+**Human repeat content.** Each human window was annotated with the RepeatMasker track of hs1 (= T2T-CHM13). CHM13 is the whole assembly (3,117 Mbp).
+
+| Repeat class (% of bp) | CHM13 | v3 | v4 | v5 |
+|---|---|---|---|---|
+| Alu | 10.02 | 7.85 | 4.97 | 7.87 |
+| L1 | 16.60 | 16.54 | 14.77 | 16.57 |
+| Other LINE | 4.11 | 4.35 | 4.99 | 4.35 |
+| Other SINE | 2.75 | 2.91 | 3.33 | 2.91 |
+| LTR/ERV | 8.73 | 9.12 | 9.71 | 9.12 |
+| Satellite | 5.12 | 4.62 | 1.04 | 4.61 |
+| DNA transposons | 3.50 | 3.70 | 4.04 | 3.70 |
+| Simple / low complexity | 3.39 | 2.91 | 2.37 | 2.90 |
+| **Any repeat** | **54.45** | **52.22** | **45.47** | **52.24** |
+| Windows with ≥ 240 bp of one Alu (% of windows) | 3.47 | 2.25 | 0.11 | 2.26 |
+
+- The v5 human category matches v3 and is close to the genome. Alu is the exception: about 20% below the genome, and 35% fewer near-complete Alus.
+- The BLAST step does not explain the Alu shortfall, since it removed only 7 human windows. The likely cause, not checked, is the `evaluation_standard` k-mer screen (93,397 human windows in every version), because young Alus and satellites are nearly identical across copies.
+
+**Exact overlap with test reads.** Windows were counted by the canonical 31-mers they share with `fullset_test`. 120 shared 31-mers is about ≥ 150 bp of identical sequence.
+
+- Human against any test read: 0 windows share ≥ 120 31-mers, in both v4 and v5.
+- ViraMiner against viral test reads: 56 windows in v4, 1 in v5. In both virus categories, windows that share ≥ 20 31-mers with viral reads also went down.
+- Remaining gap, also present in v4: about 465 ViraMiner windows share ≥ 150 bp exactly with non-viral test reads, and 19 share ≥ 240 bp. They look like overlapping pieces of the same contigs, which the 80%-of-the-read near-duplicate rule misses. That is 0.26% of ViraMiner, all non-viral, and pretraining uses no labels.
+
 ## Known limitations
 
 - `refseq_viral` includes plant and insect viruses. `uhgv` is labelled phage as a whole, but contains some eukaryotic gut viruses.
 - The species cap is taxonomic, not sequence clustering, so near-identical strains of one species can still repeat.
-- In v4, the BLAST screen removes repeat-rich human windows, so the human category has fewer repeats than the genome itself. To leave human windows out of the BLAST screen, pass `--blast-categories virus_eukaryotic,virus_prokaryotic,bacteria,viraminer`.
+- In v4, the BLAST screen removes repeat-rich human windows, so the human category has fewer repeats than the genome itself. v5 does not have this problem. To leave human windows out of the BLAST screen, pass `--blast-categories virus_eukaryotic,virus_prokaryotic,bacteria,viraminer`.
 - In v5, the informativeness mask has no effect on the result (see the v5 section); what keeps the human repeats in the corpus is `--blast-homology-labels 1`. The mask is still computed (about 2 min) and written to `informative_mask.csv`.
+- `fullset_test` labels one HERV-K read as viral, while the corpus's human category contains about 9% LTR/ERV. Expect endogenous-retrovirus reads among the false negatives.
 - All bacteria come from the gut (UHGG). There are no skin or cervical genomes, although ViraMiner samples include those sites.
 - Sources not used:
   - IMG/VR: needs a JGI account and is mostly environmental.
